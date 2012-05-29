@@ -1,0 +1,213 @@
+# This file is part of the Perl Collaborative Filtering Framework
+#
+# Copyright (C) 2006, 2007, 2008 Zeno Gantner
+#
+# This software is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+package Predictor::CoClustering;
+
+use Carp;
+use File::Slurp;
+
+use CoClustering::Optimized;
+use CoClustering::Utility;
+use Ratings::Sparse;
+
+sub new {
+	my ($class, $arg_ref) = @_;
+
+	my $self = {
+		verbose     => 0,
+		fix_results => 1,
+		%$arg_ref
+#               known_ratings
+#               cluster_file | user_clustering_ref + item_clustering_ref
+#		u_cluster_averages_ref => $a_rc_ref,
+#		i_cluster_averages_ref => $a_cc_ref,
+#		cocluster_averages_ref => $a_coc_ref,
+#		u_averages_ref         => \@a_r,
+#		i_averages_ref         => \@a_c,
+		
+	};
+
+	$self->{scale} = $self->{known_ratings}->{scale};
+	if (exists $self->{scale}) {
+		$self->{number_of_users} = $self->{scale}->number_of_users;
+		$self->{number_of_items} = $self->{scale}->number_of_items;
+		$self->{scale_min}       = $self->{scale}->min;
+		$self->{scale_max}       = $self->{scale}->max;
+		$self->{scale_binary}    = $self->{scale}->binary;
+	}
+
+	if (exists $self->{cluster_file}) {
+		print STDERR "Use clustering information from file '$self->{cluster_file}'.\n" if $self->{verbose};
+		my @lines = read_file($self->{cluster_file})
+			or die "Could not open file '$self->{cluster_file}'\n";
+
+		# remove empty lines
+		my @lines_new;
+		foreach my $line (@lines) {
+			chomp $line;
+			if (! $line eq '') {
+				push @lines_new, $line;
+			}
+		}
+		@lines = @lines_new;
+
+		my @row_clustering = ();
+		while ($lines[0] =~ s/(\d+):(\d+)//) {
+			my $row     = $1;
+			my $cluster = $2;
+			$row_clustering[$row] = $cluster;
+		}
+		$self->{user_clustering_ref}     = \@row_clustering;
+		print STDERR "Finished reading in user clusters.\n" if $self->{verbose};
+
+		my @col_clustering = ();
+		while ($lines[1] =~ s/(\d+):(\d+)//) {
+			my $col     = $1;
+			my $cluster = $2;
+			$col_clustering[$col] = $cluster;
+		}
+		$self->{item_clustering_ref}     = \@col_clustering;
+		print STDERR "Finished reading in item clusters.\n" if $self->{verbose};
+
+		# check whether complete
+		if (scalar(@row_clustering) != $self->{number_of_users}) {
+			carp 'Wrong number of row cluster assignments: ' . scalar(@row_clustering);
+			carp "Should be $self->{number_of_users}";
+		}
+		if (scalar(@col_clustering) != $self->{number_of_items}) {
+			carp 'Wrong number of column cluster assignments: ' . scalar(@col_clustering);
+			carp "Should be $self->{number_of_items}";
+		}
+	}
+	else {
+		print STDERR "Don't use cluster file.\n" if $self->{verbose};
+	}
+
+	if (!exists $self->{number_of_user_clusters}) {
+		my $max_user_cluster_id = 0;
+		foreach my $cluster_id (@{$self->{user_clustering_ref}}) {
+		    if (!defined $cluster_id) {
+		        croak "cluster_id not defined";
+		    }
+			if ($cluster_id > $max_user_cluster_id) {
+				$max_user_cluster_id = $cluster_id;
+			}
+		}
+		$self->{number_of_user_clusters} = $max_user_cluster_id + 1;
+	}
+	if (!exists $self->{number_of_item_clusters}) {
+		my $max_item_cluster_id = 0;
+		foreach my $cluster_id (@{$self->{item_clustering_ref}}) {
+		    if (!defined $cluster_id) {
+		        croak "cluster_id not defined";
+		    }
+			if ($cluster_id > $max_item_cluster_id) {
+				$max_item_cluster_id = $cluster_id;
+			}
+		}
+		$self->{number_of_item_clusters} = $max_item_cluster_id + 1;
+	}
+	print STDERR "Number of user/item clusters: $self->{number_of_user_clusters}/$self->{number_of_item_clusters}\n"
+		if $self->{verbose};
+
+	if (!exists $self->{global_average}) {
+		$self->{global_average} = $self->{known_ratings}->{global_average};
+	}
+	if (!exists $self->{u_averages_ref}) {
+		$self->{u_averages_ref} = $self->{known_ratings}->compute_row_averages;
+	}
+	if (!exists $self->{i_averages_ref}) {
+		$self->{i_averages_ref} = $self->{known_ratings}->compute_col_averages;
+	}
+	if (  !exists $self->{u_cluster_averages_ref}
+           || !exists $self->{i_cluster_averages_ref}
+           || !exists $self->{cocluster_averages_ref}) {
+		($self->{u_cluster_averages_ref},
+		 $self->{i_cluster_averages_ref},
+		 $self->{cocluster_averages_ref})
+			= compute_cluster_averages({
+				known_ratings      => $self->{known_ratings},
+				row_clustering_ref => $self->{user_clustering_ref},
+				col_clustering_ref => $self->{item_clustering_ref},
+				k                  => $self->{number_of_user_clusters},
+				l                  => $self->{number_of_item_clusters},
+				global_average     => $self->{global_average},
+			});
+	}
+
+	$self->{description} = "coclustering (k=$self->{number_of_user_clusters}/l=$self->{number_of_item_clusters})";
+
+	return bless $self, $class;
+}
+
+
+# TODO: initialize from clusterings (from disk) only
+
+# TODO: answer known ratings, too (isn't this a problem, e.g. on Netflix data??
+sub predict {
+	my ($self, $user_id, $item_id) = @_;
+
+	#my $user_clustering_ref = $self->{user_clustering_ref};
+	my $g = $self->{user_clustering_ref}->[$user_id];
+	my $h = $self->{item_clustering_ref}->[$item_id];
+	my $number_of_users = $self->{number_of_users};
+	my $number_of_items = $self->{number_of_items};
+
+	my $result;
+	if ($user_id < $number_of_users && $item_id < $number_of_items) {
+		$result = $self->{u_averages_ref}->[$user_id]
+		 	+ $self->{i_averages_ref}->[$item_id]
+			- $self->{u_cluster_averages_ref}->[$g]
+			- $self->{i_cluster_averages_ref}->[$h]
+			+ $self->{cocluster_averages_ref}->[$g][$h];
+	}
+	elsif ($user_id < $number_of_users) {
+		$result = $self->{u_averages_ref}->[$user_id];
+	}
+	elsif ($item_id < $number_of_items) {
+		$result = $self->{i_averages_ref}->[$item_id];
+	}
+	else {
+		$result = $self->{global_average};
+	}
+
+	# TODO: this is MovieLens-specific
+	if ($self->{fix_results}) {
+		if ($result < 1) {
+			# This may happen if there are negative item and user biases.
+			$result = 1;
+		}
+		if ($result > 5) {
+			# This may happen if there are positive item and user biases.
+			$result = 5;
+		}
+	}
+
+	return $result;
+}
+
+
+sub description {
+	my ($self) = @_;
+
+	return $self->{description};
+}
+
+1;

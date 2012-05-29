@@ -1,0 +1,330 @@
+# This predictor is capable of rating new items, but it needs at least one rating for each user.
+
+# This file is part of the Perl Collaborative Filtering Framework
+#
+# Copyright (C) 2006, 2007, 2008 Zeno Gantner
+#
+# This software is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+package Predictor::SVM;
+
+use Ratings::Sparse;
+use Predictor::Averages;
+use Predictor::Util;
+
+sub new {
+	my ($class, $arg_ref) = @_;
+
+	my $self = {
+		verbose                   => 0,
+		show_progress             => 0,
+		description               => 'svm',
+		pick_most_probable_rating => 0,
+		weighted_classes          => 1,
+		sort_attributes           => 0,
+		%$arg_ref
+	};
+
+	print STDERR "Creating object of type Predictor::SVM ... " if $self->{verbose};
+
+	if (exists $self->{ratings_file}) {
+		my $ratings_object = Ratings::MovieLens->new({
+			filename => $arg_ref->{ratings_file},
+			verbose  => $self->{verbose},
+		});
+		$self->{known_ratings} = $ratings_object->get_ratings;
+	}
+
+	$self->{scale} = $self->{known_ratings}->{scale};
+
+	if (exists $self->{scale}) {
+		$self->{number_of_users} = $self->{scale}->number_of_users;
+		if (!exists $self->{number_of_items}) {
+			$self->{number_of_items} = $self->{scale}->number_of_items;
+			#print STDERR "#i set to $self->{number_of_items}\n";
+		}
+		$self->{scale_min}       = $self->{scale}->min;
+		$self->{scale_max}       = $self->{scale}->max;
+		$self->{scale_binary}    = $self->{scale}->binary;
+
+		if (!$self->{scale_binary}) {
+			$self->{number_of_classes} = $self->{scale_max} - $self->{scale_min} + 1;
+		}
+	}
+
+	($self->{item_attributes_ref}, $self->{number_of_attributes}) = read_indexed_data_from_file(
+		$arg_ref->{item_attribute_file},
+               {number_of_items => $self->{number_of_items}}
+        );
+
+	bless $self, $class;
+
+	$self->learn_probabilites;
+	print STDERR " done.\n" if $self->{verbose};
+
+	return $self;
+}
+
+
+sub predict {
+	my ($self, $user_id, $item_id, $number_of_attributes) = @_;
+
+	if (!defined $number_of_attributes) {
+		$number_of_attributes = 500;
+	}
+
+	if (!defined $self->{item_attributes_ref}->[$item_id]) {
+		die "i: $item_id; #i: $self->{number_of_items}\n";
+	}
+	my @attributes = @{$self->{item_attributes_ref}->[$item_id]};
+	print STDERR "Item $item_id has " . scalar(@attributes) . " attributes.\n" if $self->{verbose} >= 2;
+	if (scalar(@attributes) < $number_of_attributes) {
+		$number_of_attributes = scalar(@attributes);
+	}
+	my $attrib_given_class_prob_ref = $self->{user_attrib_given_class_prob_ref}->[$user_id];
+	if (! defined $self->{user_attrib_given_class_prob_ref}->[$user_id]) {
+		die "No attribute probabilities exist for user $user_id\n";
+	}
+
+	my $argmax_class = -1;
+	my $max_prob     = 0;
+	my $rating_sum   = 0;
+	my $prob_sum     = 0;
+
+	CLASS:
+	foreach my $class (1 .. $self->{number_of_classes}) {
+		my $prob_product    = 1;
+		my $user_class_prob = $self->{user_class_prob_ref}->[$user_id]->[$class - 1];
+		next CLASS if $user_class_prob == 0;
+		
+		my $unknown_attrib_given_class_prob     # means: Attribute has no rating by this user.
+                 = 1 / ($self->{user_number_of_class_attributes_ref}->[$user_id]->[$class - 1] + $self->{number_of_attributes});
+		# (add-one smoothing, Laplace's law)
+
+		my @attribute_probabilities = ();
+		foreach my $attribute_id (@attributes) {
+			if (exists $attrib_given_class_prob_ref->{$attribute_id}) {
+				push @attribute_probabilities, $attrib_given_class_prob_ref->{$attribute_id}->[$class - 1];
+			}
+			else {
+				push @attribute_probabilities, $unknown_attrib_given_class_prob;
+			}
+		}
+
+		# Use only a certain number attributes to avoid numeric precision problems.
+		if ($number_of_attributes < scalar(@attribute_probabilities)) {
+			my @used_attribute_probabilities = splice (@attribute_probabilities, 0, $number_of_attributes);
+
+			if ($self->{sort_attributes}) {
+				sort { $b <=> $a } @attribute_probabilities;
+			}
+			foreach my $prob (@used_attribute_probabilities) {
+				$prob_product = $prob_product * $prob;
+				print STDERR "$prob_product\n" if $self->{verbose} >= 3;
+			}
+		}
+		else {
+			foreach my $prob (@attribute_probabilities) {
+				$prob_product = $prob_product * $prob;
+				print STDERR "$prob_product\n" if $self->{verbose} >= 3;
+			}
+		}
+
+		my $class_prob = $prob_product * $user_class_prob;
+		print STDERR " cp $class: $class_prob\n" if $self->{verbose} >= 2;
+		if ($class_prob > $max_prob) {
+			$argmax_class = $class;
+			$max_prob     = $class_prob;
+		}
+
+		$rating_sum = $rating_sum + $class_prob * $class;
+		$prob_sum   = $prob_sum   + $class_prob;
+	}
+
+	my $result;
+	if ($self->{pick_most_probable_rating}) {
+		print STDERR "probability sum: $prob_sum, pick class $argmax_class\n" if $self->{verbose} >= 2;
+		if ($argmax_class == -1) {
+			print STDERR "u $user_id i $item_id: precision error, #attributes " . $number_of_attributes . "\n"
+				if $self->{verbose};
+			return $self->predict($user_id, $item_id, $number_of_attributes - 1);
+		}
+		$result = $argmax_class;
+	}
+	elsif ($self->{weighted_classes}) {
+		print STDERR "probability sum: $prob_sum, ratings sum: $rating_sum\n" if $self->{verbose} >= 2;
+		if ($prob_sum == 0) {
+			print STDERR "u $user_id i $item_id: probability sum is 0, #attributes " . $number_of_attributes . "\n"
+				if $self->{verbose};
+			return $self->predict($user_id, $item_id, $number_of_attributes - 1);
+			# TODO: get rid of recursion, turn into a loop
+		}
+		$result = $rating_sum / $prob_sum ;
+	}
+	else {
+		return;
+	}
+	
+	# TODO: this is MovieLens-specific
+	if ($result > 5) {
+		warn "Strange prediction result for user $user_id, item $item_id: $result\n";
+		return 5;
+	}
+	elsif ($result < 1) {
+		warn "Strange prediction result for user $user_id, item $item_id: $result\n";
+		return 1;
+	}
+	return $result;
+}
+
+
+sub learn_probabilites {
+	my ($self, $arg_ref) = @_;
+
+	my $number_of_classes = $self->{number_of_classes};
+
+	my $user_ratings_ref = $self->{known_ratings}->get_rows;
+
+	my @user_class_prob                 = ();
+	my @user_attrib_given_class_prob    = ();
+	my @user_number_of_class_attributes = ();
+
+	# TODO think about getting rid of -1 everywhere, use (undef, 0, 0, 0, 0, 0) instead
+	foreach my $user_id (0 .. $self->{number_of_users} - 1) {
+		print STDERR '.' if $self->{show_progress};
+		my @rating_count           = map { $_ = 0 } (0 .. ($self->{number_of_classes} - 1));
+		my %attribute_rating_count = ();
+		my @class_attributes       = ({}, {}, {}, {}, {});
+		foreach my $key (keys %{$user_ratings_ref->[$user_id]}) {
+			my ($row, $item_id) = unpack($PACK_TEMPLATE, $key);
+			my $rating = $user_ratings_ref->[$user_id]->{$key};
+			
+			my @attributes = @{$self->{item_attributes_ref}->[$item_id]};
+			$rating_count[$rating - 1]++;
+			foreach my $attribute_id (@attributes) {
+				if (! exists $attribute_rating_count{$attribute_id}) {
+					$attribute_rating_count{$attribute_id}
+					 = [ map { $_ = 0 } (0 ..  ($self->{number_of_classes} - 1)) ];
+				}
+				++$attribute_rating_count{$attribute_id}->[$rating - 1];
+
+				$class_attributes[$rating - 1]->{$attribute_id} = 1;
+			}
+		}
+
+		my %attrib_given_class_prob = ();
+		foreach my $attribute_id (keys %attribute_rating_count) {
+			$attrib_given_class_prob{$attribute_id} = [ map { $_ = 0 } (0 ..  ($self->{number_of_classes} - 1)) ];
+		}
+		my $number_of_items_rated_by_user = scalar(keys %{$user_ratings_ref->[$user_id]});
+		if ($number_of_items_rated_by_user == 0) {
+			die "user $user_id hasn't rated any items\n";
+		}
+		my @number_of_class_attributes = ();
+		foreach my $class (1 .. $number_of_classes) { # TODO: this is sort of MovieLens-specific ...
+			$user_class_prob[$user_id]->[$class - 1] = $rating_count[$class - 1] / $number_of_items_rated_by_user;
+			
+			$number_of_class_attributes[$class - 1] = scalar(keys %{$class_attributes[$class - 1]});
+
+			foreach my $attribute_id (keys %attribute_rating_count) {
+				# add-one smoothing (Laplace's law)
+				$attrib_given_class_prob{$attribute_id}->[$class - 1]
+				 =  ($attribute_rating_count{$attribute_id}->[$class - 1] + 1)
+				  / ($number_of_class_attributes[$class - 1] + $self->{number_of_attributes});
+			}
+		}
+		my $contains_only_zeroes = 1;
+		foreach my $prob (@user_class_prob) {
+			if ($prob != 0) {
+				$contains_only_zeroes = 0;
+			}
+		}
+		if ($contains_only_zeroes) {
+			warn "User $user_id does not have any ratings.\n";
+		}
+
+		$user_number_of_class_attributes[$user_id] = \@number_of_class_attributes;
+		$user_attrib_given_class_prob[$user_id]    = \%attrib_given_class_prob;
+	}
+
+	$self->{user_class_prob_ref}                 = \@user_class_prob;
+	$self->{user_number_of_class_attributes_ref} = \@user_number_of_class_attributes;
+	$self->{user_attrib_given_class_prob_ref}    = \@user_attrib_given_class_prob;
+}
+
+
+# TODO: move to some place where it can be shared
+# class method
+sub read_indexed_data_from_file {
+	my ($filename, $arg_ref) = @_;
+
+	my $number_of_items = $arg_ref->{number_of_items};
+	# TODO: get from argref
+	my $separator = "\t+";  # TODO: use quote regexp
+	my $one_based = 1;
+
+	my $max_attribute_id = 0;
+	my @data_array = map { $_ = [] } (0 ..  ($number_of_items - 1));
+	#my @data_array = ();
+	open FILE, "< $filename" or die "Can't open '$filename': $!";
+	while( <FILE> ) {
+		my $line = $_;
+
+	        next if $line =~ /^(\s)*$/;
+	        chomp $line;
+
+		if ($line =~ /^(\d+)$separator(\d+)/) {
+			my $movie_id     = $1 - $one_based;
+			my $attribute_id = $2 - $one_based;
+
+			#if (defined $data_array[$movie_id]) {
+				push @{$data_array[$movie_id]}, $attribute_id;
+			#}
+			#else {
+			#	$data_array[$movie_id] = [$attribute_id];
+			#}
+
+			if ($attribute_id > $max_attribute_id) {
+				$max_attribute_id = $attribute_id;
+			}
+		}
+		else {
+			warn "Could not parse line '$line'\n";
+		}
+	}
+	close FILE;
+
+	# repair the data_array (there may be movies w/o attributes)
+	#foreach my $i (0 .. scalar(@data_array) - 1) {
+	#	if (!defined $data_array[$i]) {
+	#		$data_array[$i] = [];
+	#	}
+	#}#
+	#my $movielens_number_of_items = 1682;
+
+	my $number_of_attributes = $max_attribute_id + 1;
+	return (\@data_array, $number_of_attributes);
+}
+
+
+sub description {
+	my ($self) = @_;
+
+	return $self->{description};
+}
+
+1;

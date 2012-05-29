@@ -1,0 +1,56 @@
+use strict;
+use warnings;
+use encoding 'utf8';
+
+package Ratings::Random;
+use base 'Exporter';
+our @EXPORT_OK = qw{ create_matrix };
+
+
+# TODO only create sparse matrix
+sub create_matrix($$$$$) {
+	my ($number_of_users, $number_of_items, $density, $scale_from, $scale_to) = @_;
+	# TODO: named arguments
+
+	# sparsity is being ignored right now TODO
+
+	my $verbose = 1;
+
+	my @confidence;
+	my @rating;
+
+	print STDERR "Creating ratings and confidence matrix ... " if $verbose;
+	# random confidence matrix:
+	for (my $i = 0; $i < $number_of_users; $i++) {
+		my @tmp;
+		for (my $j = 0; $j < $number_of_items; $j++) {
+			my $random_number = int(rand 1 / $density) + 1;
+			if ($random_number == int (1 / $density) ) {
+				$tmp[$j] = 1;
+			}
+			else {
+				$tmp[$j] = 0;
+			}
+		}
+		$confidence[$i] = [ @tmp ];
+		#	print "@tmp \n";
+	}
+	# random ratings matrix:
+	for (my $i = 0; $i < $number_of_users; $i++) {
+		my @tmp;
+		for (my $j = 0; $j < $number_of_items; $j++) {
+			if ($confidence[$i][$j] == 1) {
+				$tmp[$j] = int(rand ($scale_to - $scale_from + 1)) + $scale_from;
+			} else {
+				$tmp[$j] = 0;
+			}
+		}
+		$rating[$i] = [ @tmp ];
+	#	print "@tmp \n";
+	}
+	print STDERR "done.\n" if $verbose;
+
+	return (\@rating, \@confidence);
+}
+
+1;

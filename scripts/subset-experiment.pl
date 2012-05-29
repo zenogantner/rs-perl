@@ -1,0 +1,117 @@
+#!/usr/bin/perl
+
+# This file is part of the Perl Collaborative Filtering Framework
+#
+# Copyright (C) 2006, 2007, 2008 Zeno Gantner
+#
+# This software is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+binmode STDOUT, ':utf8';
+binmode STDERR, ':utf8';
+use English qw( -no_match_vars );
+use Getopt::Long;
+use Carp;
+
+my $verbose  = 0;
+my $ml_path  = "$ENV{HOME}/data/ml/subsets";
+my $bin_path = "$ENV{HOME}/software/zeno/rs-perl/";
+
+GetOptions(
+    'help'       => \(my $help = 0),
+    'verbose+'   => \$verbose,
+    'method=s'   => \(my $method = 'coclustering'),
+    'k=i'        => \(my $k = 3),
+    'l=i'        => \(my $l = 3),
+) or usage(-1);
+
+if ($help) {
+    usage(0);
+}
+
+
+
+my $MAX_ITER = 100;
+my $coclustering_arguments = "--max-iter=$MAX_ITER --k=$k --l=$l --compute-error";
+
+
+foreach my $subset_size (10, 20, 30, 40, 50, 60, 70, 80, 90) {
+    if ($method eq 'coclustering') {
+	    # static initialization
+	    foreach my $split (1 .. 5) {
+		    my $training_parameters = "--training-file=$ml_path/u-${subset_size}-subset-${split}.base";
+		    my $test_parameters     = "--test-file=$ml_path/u-${subset_size}-subset-${split}.test";
+		    execute_command({
+    			command     => "$bin_path/coclustering.pl $training_parameters $test_parameters $coclustering_arguments",
+	    		result_file => "static-$k-$k-${MAX_ITER}it-${subset_size}-subset",
+    		});
+    	}
+
+    	# random initialization
+    	foreach my $split (1 .. 5) {
+	    	foreach my $random_run (1 .. 8) {
+			    my $training_parameters = "--training-file=$ml_path/u-${subset_size}-subset-$split.base --random";
+			    my $test_parameters     = "--test-file=$ml_path/u-${subset_size}-subset-${split}.test";
+			    execute_command({
+				    command     => "$bin_path/coclustering.pl $training_parameters $test_parameters $coclustering_arguments",
+				    result_file => "random-$k-$l-${MAX_ITER}it-${subset_size}-subset",
+			    });
+		    }
+	    }
+    }
+    elsif ($method =~ m{((user|item|global)-)?average}xms) {
+        foreach my $split (1 .. 5) {
+            my $training_parameters = "--training-file=$ml_path/u-${subset_size}-subset-$split.base";
+            my $test_parameters     = "--test-file=$ml_path/u-${subset_size}-subset-${split}.test";
+		    execute_command({
+    		    command     => "$bin_path/evaluate.pl $training_parameters $test_parameters --predictor=$method",
+			    result_file => "${method}-${subset_size}-subset",
+		    });
+        }
+    }
+    else {
+        croak "Unknown method '$method'";
+    }
+}
+
+
+sub execute_command {
+	my ($arg_ref) = @_;
+
+	my $command     = $arg_ref->{'command'};
+	my $result_file = $arg_ref->{'result_file'};
+
+	print "command: '$command'\n";
+	print "results: '$result_file'\n";
+	system("$command >> $result_file");
+}
+
+sub usage {
+    my ($exit_code) = @_;
+
+    print << "END";
+Run experiments with MovieLens subsets
+Copyright (c) 2007, 2008 Zeno Gantner
+
+usage: $PROGRAM_NAME [OPTIONS]
+
+  general options:
+    --help         display this usage information and exit
+    --verbose      increment verbosity level by one
+    TODO
+END
+    exit $exit_code;
+}

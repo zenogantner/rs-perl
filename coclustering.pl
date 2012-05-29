@@ -1,0 +1,262 @@
+#!/usr/bin/perl
+
+# This file is part of the Perl Collaborative Filtering Framework
+#
+# Copyright (C) 2006, 2007, 2008 Zeno Gantner
+#
+# This software is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+
+use strict;
+use warnings;
+use utf8;
+use English qw( -no_match_vars );
+use Getopt::Long;
+use File::Slurp;
+
+use CoClustering::Optimized;
+use Ratings::Random;
+use Ratings::Convert;
+use Ratings::MovieLens;
+use Ratings::Sparse;
+use Predictor::CoClustering;
+use Evaluation;
+
+# Global variables:
+#  to be removed
+my $number_of_users;
+my $number_of_items;
+my ($scale_from, $scale_to) = (1, 10);
+#   method parameters
+my $number_of_user_clusters = 3;
+my $number_of_item_clusters = 3;
+my $max_iterations          = 50;
+my $random_clustering       = 0;
+
+#   program parameters
+my $help    = 0;
+my $verbose = 0;
+my $debug   = 0;
+
+my $training_file      = '';
+my $test_file          = '';
+my $read_cluster_file  = '';
+my $compute_error      = 0;
+my $top_n              = 0;
+my $display_clustering = 0;
+
+my $max_user_id        = 942;  # TODO: This should not be hard-coded here
+my $max_item_id        = 1681; #       dto.
+
+GetOptions(
+    'help'                => \$help,
+    'verbose+'            => \$verbose,
+    'debug+'              => \$debug,
+    'random-clustering'   => \$random_clustering,
+    'training-file=s'     => \$training_file,
+    'test-file=s'         => \$test_file,
+    'from=i'              => \$scale_from,
+    'to=i'                => \$scale_to,
+#    'users=i'             => \$number_of_users,            'm=i' => \$number_of_users,
+#    'items=i'             => \$number_of_items,            'n=i' => \$number_of_items,
+    'user-clusters=i'     => \$number_of_user_clusters, 'k=i' => \$number_of_user_clusters,
+    'item-clusters=i'     => \$number_of_item_clusters, 'l=i' => \$number_of_item_clusters,
+#    'density=f'           => \$density,
+    'max-iter=i'          => \$max_iterations,
+    'compute-error'       => \$compute_error,
+    'top-n=i'             => \$top_n,
+    'display-clustering'  => \$display_clustering,
+    'read-cluster-file=s' => \$read_cluster_file,
+) or usage(-1);
+
+if ($help) {
+    usage(0);
+}
+
+if ($compute_error && $test_file eq '') {
+    die "If you want to compute the error, please use --test-file=...\n";
+}
+
+my $start;
+my $seconds;
+
+my $known_ratings;
+if ($training_file) {
+    my $ratings_reader = Ratings::MovieLens->new({
+        filename => $training_file,
+        verbose  => $verbose,
+    });
+
+    $known_ratings = $ratings_reader->get_ratings;
+    $number_of_users = $known_ratings->{scale}->number_of_users;
+    $number_of_items = $known_ratings->{scale}->number_of_items;
+}
+else {
+    print STDERR "Please use --training-file...\n\n";
+    usage(-1);
+}
+
+print STDERR "$number_of_users users, $number_of_items items, $number_of_user_clusters/$number_of_item_clusters clusters.\n" if $verbose;
+
+my @row_clustering = ();
+my @col_clustering = ();
+if ($read_cluster_file) {
+    print STDERR "Use clustering information from file '$read_cluster_file'.\n";
+
+    my @lines = read_file($read_cluster_file);
+
+    # remove empty lines
+    my @lines_new;
+    foreach my $line (@lines) {
+        chomp $line;
+        if (! $line eq '') {
+            push @lines_new, $line;
+        }
+    }
+    @lines = @lines_new;
+
+    while ($lines[0] =~ s/(\d+):(\d+)//) {
+        my $row = $1;
+        my $row_cluster = $2;
+        if ($row_cluster >= $number_of_user_clusters) {
+            die "Cluster ID $row_cluster is to high, maximum value is " . $number_of_user_clusters - 1 . "\n";
+        }
+        $row_clustering[$row] = $row_cluster;
+    }
+    while ($lines[1] =~ s/(\d+):(\d+)//) {
+        my $col = $1;
+        my $col_cluster = $2;
+        if ($col_cluster >= $number_of_item_clusters) {
+            die "Cluster ID $col_cluster is to high, maximum value is " . $number_of_item_clusters - 1 . "\n";
+        }
+        $col_clustering[$col] = $col_cluster;
+    }
+}
+
+$start = (times)[0];
+my $result_ref = CoClustering::Optimized::static_training({
+    known_ratings  => $known_ratings,
+    user_clusters  => $number_of_user_clusters,
+    item_clusters  => $number_of_item_clusters,
+    max_iterations => $max_iterations,
+    scalar(@row_clustering) == 0 ? () : (
+        row_clustering_ref => \@row_clustering,
+        col_clustering_ref => \@col_clustering,
+    ),
+    random         => $random_clustering,
+    verbose        => $verbose,
+    debug          => $debug,
+
+});
+
+$seconds = (times)[0] - $start;
+print STDERR "Time: $seconds s.\n";
+
+if ($compute_error) {
+    my $test_ratings;
+    my $ratings_reader = Ratings::MovieLens->new({
+        filename => $test_file,
+        verbose  => $verbose,
+    });
+    $test_ratings = $ratings_reader->get_ratings;
+
+    my $predictor = Predictor::CoClustering->new({
+        known_ratings          => $known_ratings,
+        user_clustering_ref    => $result_ref->{row_clustering_ref},
+        item_clustering_ref    => $result_ref->{col_clustering_ref},
+        u_cluster_averages_ref => $result_ref->{rowcluster_averages_ref},
+        i_cluster_averages_ref => $result_ref->{colcluster_averages_ref},
+        cocluster_averages_ref => $result_ref->{cocluster_averages_ref},
+        u_averages_ref         => $result_ref->{row_averages_ref},
+        i_averages_ref         => $result_ref->{col_averages_ref},
+    });
+
+
+    if ($top_n == 0) {
+        my $error_ref = Evaluation::compute_error({
+            test_ratings => $test_ratings,
+            predict_ref  => sub { return $predictor->predict(@_) },
+        });
+
+        print "$number_of_user_clusters $number_of_item_clusters ";
+        #printf "rounded MAE/MAE/RMSE (iterations): %.4f; %.4f; %.4f ($result_ref->{iterations}/$max_iterations)\n",
+        printf "%.4f %.4f %.4f $result_ref->{iterations} $max_iterations\n",
+            $error_ref->{rounded_mae}, $error_ref->{mae}, $error_ref->{rmse};
+    }
+    else {
+        my $result_ref = Evaluation::compute_top_n_error({
+            top_n           => $top_n,
+            test_ratings    => $test_ratings,
+            known_ratings   => $known_ratings,
+            predict_ref     => sub { return $predictor->predict(@_) },
+            verbose         => $verbose,
+        });
+        printf "n=$top_n, precision=%.4f, recall=%.4f, f1=%.4f\n",
+            $result_ref->{precision}, $result_ref->{recall}, $result_ref->{f1};
+    }
+
+}
+
+if ($display_clustering) {
+    my $row_clustering_ref = $result_ref->{row_clustering_ref};
+    my $col_clustering_ref = $result_ref->{col_clustering_ref};
+    my $m = scalar @$row_clustering_ref;
+    my $n = scalar @$col_clustering_ref;
+
+    print 'row clustering: ';
+    for (my $i = 0; $i < $m; $i++) {
+        print "$i:$row_clustering_ref->[$i] ";
+    }
+    print "\n";
+
+    print 'column clustering: ';
+    for (my $j = 0; $j < $n; $j++) {
+        print "$j:$col_clustering_ref->[$j] ";
+    }
+    print "\n";
+
+}
+
+print STDERR "\n";
+
+
+sub usage {
+    my ($exit_code) = @_;
+
+    print << 'END';
+Compute coclusters for MovieLens data.
+(C) 2007, 2008, 2009 Zeno Gantner
+
+usage: $PROGRAM_NAME [OPTIONS]
+
+    --help                     display this usage information and exit
+    --verbose                  increment verbosity level by one
+    --debug                    increment debug level by one
+    --random-clustering        initialize clustering randomly
+    --training-file=FILE       read training data from FILE
+    --test-file=FILE           read test data from FILE
+    --from=A                   rating scale starts at A
+    --to=B                     rating scale ends at B
+    --user-clusters=K          set number of user clusters to K
+    --item-clusters=L          set number of item clusters to L
+    --max-iter=I               set maximum number of iterations to I
+    --compute-error            compute MAE and RMSE (needs test data)
+    --top-n=N                  compute precision and recall for the top-N items
+                               of each user
+    --display-clustering       print clustering to STDOUT
+    --read-cluster-file=FILE   read clustering from FILE
+END
+
+    exit $exit_code;
+}

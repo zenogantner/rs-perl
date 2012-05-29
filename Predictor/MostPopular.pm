@@ -1,0 +1,110 @@
+# Provide a rating by popularity (number of ratings).
+# This predictor is able to handle unknown users (1) and items (2)
+#   (1) The predictor does not look at the user ID at all.
+#   (2) Because the item has not been rated at all, it is ranked last.
+
+# This file is part of the Perl Collaborative Filtering Framework
+#
+# Copyright (C) 2006, 2007, 2008 Zeno Gantner
+#
+# This software is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+use encoding 'utf8'; # ä
+
+package Predictor::MostPopular;
+
+use Ratings::Sparse;
+use Ratings::MovieLens;
+
+sub new {
+	my ($class, $arg_ref) = @_;
+
+	my $self = {
+		verbose                => 0,
+
+		%$arg_ref
+		# known_ratings | ratings_file
+		# number_of_users
+		# number_of_items
+		# predictor
+	};
+
+	print STDERR "Creating object of type Predictor::MostPopular.\n" if $self->{verbose};
+
+	if (exists $self->{ratings_file}) {
+		my $ratings_reader = Ratings::MovieLens->new({
+			filename => $self->{ratings_file},
+			verbose  => $self->{verbose},
+		});
+
+		$self->{ratings} = $ratings_reader->get_ratings;
+	}
+
+	$self->{scale} = $self->{known_ratings}->{scale};
+
+	if (exists $self->{scale}) {
+		$self->{number_of_users} = $self->{scale}->number_of_users;
+		$self->{number_of_items} = $self->{scale}->number_of_items;
+		$self->{scale_min}       = $self->{scale}->min;
+		$self->{scale_max}       = $self->{scale}->max;
+		# The attribute "binary" does not make a difference for MostPopular if ratings are stored sparsely.
+	}
+
+	my $item_ratings_ref = $self->{known_ratings}->get_cols;
+	my @item_ratings_count = ();
+	foreach my $item_id (0 .. $self->{number_of_items} - 1) {
+		$item_ratings_count[$item_id] = scalar(keys %{$item_ratings_ref->[$item_id]});
+	}
+	my @ranked_items = sort{$item_ratings_count[$b] <=> $item_ratings_count[$a]} (0 .. $self->{number_of_items} - 1);
+	$self->{item_ids_by_popularity_ref} = \@ranked_items;
+
+	my @item_rank = ();
+	my $i = 1;
+	foreach my $item_id (@ranked_items) {
+		$item_rank[$item_id] = $i;
+		$i++;
+	}
+	$self->{item_rank_ref} = \@item_rank;
+
+	$self->{description} = 'most-popular';
+
+	return bless $self, $class;
+}
+
+
+sub predict {
+	my ($self, $user_id, $item_id) = @_;
+
+	my $normalized_result;
+	if ($item_id < $self->{number_of_items}) {
+		$normalized_result = 1 - ($self->{item_rank_ref}->[$item_id] / $self->{number_of_items});
+	}
+	else {  # unknown item
+		$normalized_result = 0;
+	}
+	my $movielens_result  = $normalized_result * 4 + 1;
+	# this is very MovieLens-specific; use information from the Ratings::Scale object
+	return $movielens_result;
+};
+
+
+sub description {
+	my ($self) = @_;
+
+	return $self->{description};
+}
+
+1;

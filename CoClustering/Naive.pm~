@@ -1,0 +1,339 @@
+# Compute co-clusters for a given matrix.
+# The naming and use of variables follows the paper/technical report by Thomas George and Srujana Merugu.
+# The reference to the ratings matrix A is called $ratings, the reference to the confidence matrix W is called $confidence.
+# In the papers, the indices start with 1, in the program they are zero-based.
+
+# This file is part of the Perl Collaborative Filtering Framework
+#
+# Copyright (C) 2006, 2007, 2008 Zeno Gantner
+#
+# This software is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+
+package CoClustering::Naive;
+
+# Function prototypes:
+sub contains_only_zeros ($);
+sub static_training (@);
+sub compute_global_average ($$);
+sub array_get_minimum_index (@);
+sub compute_sparseness ($);
+
+sub static_training (@) {
+	my ($arg_ref) = @_;
+
+	# get arguments, set default values
+	my $ratings = $arg_ref->{ratings};	# reference to ratings matrix
+	my $confidence = $arg_ref->{confidence};# reference to confidence matrix
+	my $verbose        = defined $arg_ref->{verbose}        ? $arg_ref->{verbose}        : 0;
+	my $debug          = defined $arg_ref->{debug}          ? $arg_ref->{debug}          : 0;
+	my $max_iterations = defined $arg_ref->{max_iterations} ? $arg_ref->{max_iterations} : 1000;
+
+	my $m = @$ratings;		# number of users
+	my $n = @{$ratings->[0]};	# number of items
+
+	# clustering arguments are a bit more tricky ...
+	my @user_clustering;
+	my $k;
+	if (defined $arg_ref->{rho}) {
+		@user_clustering = @$arg_ref->{rho};
+		$k = array_get_maximum_value(@user_clustering) + 1;
+	} else {
+		$k = $arg_ref->{user_clusters};
+		@user_clustering = CoClustering::Utility::create_clustering($m, $k);
+	}
+	my @item_clustering;
+	my $l;
+	if (defined $arg_ref->{gamma}) {
+		@item_clustering = @$arg_ref->{gamma};
+		$l = array_get_maximum_value(@user_clustering) + 1;
+	} else {
+		$l = $arg_ref->{item_clusters};
+		@item_clustering = CoClustering::Utility::create_clustering($n, $l);
+	}
+
+	if (contains_only_zeros($confidence)) {
+		die "Confidence matrix contains only zeros!\n";
+	}
+
+	my $sparseness = compute_sparseness($confidence);
+	print STDERR "sparseness: $sparseness %\n" if $verbose;
+
+	my $global_average = compute_global_average($ratings, $confidence);
+
+	# Compute average ratings of the rows:
+	my @a_r;
+	for (my $i = 0; $i < $m; $i++) {
+		my $ratings_sum = 0;
+		my $confidence_sum = 0;
+		for (my $j = 0; $j < $n; $j++) {
+			$ratings_sum = $ratings_sum + $ratings->[$i][$j];
+			$confidence_sum = $confidence_sum + $confidence->[$i][$j];
+		}
+		if ($confidence_sum != 0) {
+			$a_r[$i] = $ratings_sum / $confidence_sum;
+		} else {
+			$a_r[$i] = $global_average;
+			# This should not happen, such rows should be eliminated before the training.
+		}
+		#print STDERR "a_r[$i] = $a_r[$i]\n";
+	}
+	# ... and columns:
+	my @a_c;
+	for (my $j = 0; $j < $n; $j++) {
+		my $ratings_sum = 0;
+		my $confidence_sum = 0;
+		for (my $i = 0; $i < $m; $i++) {
+			$ratings_sum = $ratings_sum + $ratings->[$i][$j];
+			$confidence_sum = $confidence_sum + $confidence->[$i][$j];
+		}
+
+		if ($confidence_sum != 0) {
+			$a_c[$j] = $ratings_sum / $confidence_sum;
+		} else {
+			$a_c[$j] = $global_average;
+			# TODO: This should not happen, such rows should be eliminated before the training.
+		}
+
+		#print STDERR "a_c[$j] = $a_c[$j]\n";
+	}
+
+	# Precompute an invariant matrix (see technical report):
+	my @tmp1;
+	for (my $i = 0; $i < $m; $i++) {
+		my @row;
+		for (my $j = 0; $j < $n; $j++) {
+			$row[$j] = $ratings->[$i][$j] - $a_r[$i] - $a_c[$j];
+		}
+		$tmp1[$i] = [ @row ];
+	}
+
+	my $counter = 0;
+	my $delta = 1;
+	my $old_error = 0;
+	while ($delta > 0.001 && $counter < $max_iterations) {
+		# 2a. Compute averages ...
+		#  for co-clusters:
+		my @a_coc;
+				for (my $g = 0; $g < $k; $g++) {
+			for (my $h = 0; $h < $l; $h++) {
+				my $ratings_sum = 0;
+				my $confidence_sum = 0;
+
+				for (my $i = 0; $i < $m; $i++) {
+					if ($user_clustering[$i] == $g) {
+						for (my $j = 0; $j < $n; $j++) {
+							if ($item_clustering[$j] == $h) {
+								$ratings_sum = $ratings_sum + $ratings->[$i][$j];
+								$confidence_sum = $confidence_sum + $confidence->[$i][$j];
+							}
+						}
+					}
+				}
+				if ($confidence_sum != 0) {
+					$a_coc[$g][$h] = $ratings_sum / $confidence_sum;
+				} else {
+					#print STDERR "Co-cluster ($g, $h) does not contain any ratings.\n" if $verbose;
+					$a_coc[$g][$h] = $global_average;
+				}
+			}
+		}
+		#  for row clusters:
+		my @a_rc;
+		for (my $g = 0; $g < $k; $g++) {
+			my $ratings_sum = 0;
+			my $confidence_sum = 0;
+
+			for (my $i = 0; $i < $m; $i++) {
+				if ($user_clustering[$i] == $g) {
+					for (my $j = 0; $j < $n; $j++) {
+						$ratings_sum = $ratings_sum + $ratings->[$i][$j];
+						$confidence_sum = $confidence_sum + $confidence->[$i][$j];
+					}
+				}
+			}
+			if ($confidence_sum != 0) {
+				$a_rc[$g] = $ratings_sum / $confidence_sum;
+			} else {				
+				print STDERR "User cluster $g does not contain any ratings.\n" if $verbose;
+				$a_rc[$g] = $global_average;
+			}
+			
+		}
+		#  for column clusters:
+		my @a_cc;
+		for (my $h = 0; $h < $l; $h++) {
+			my $ratings_sum = 0;
+			my $confidence_sum = 0;
+
+			for (my $i = 0; $i < $m; $i++) {
+				for (my $j = 0; $j < $n; $j++) {
+					if ($item_clustering[$j] == $h) {
+						$ratings_sum = $ratings_sum + $ratings->[$i][$j];
+						$confidence_sum = $confidence_sum + $confidence->[$i][$j];
+					}
+				}
+			}
+			if ($confidence_sum != 0) {
+				$a_cc[$h] = $ratings_sum / $confidence_sum;
+			} else {
+				#print STDERR "Item cluster $h does not contain any ratings.\n" if $verbose;
+				$a_cc[$h] = $global_average;
+			}
+		}
+		
+		# 2b. Update row cluster assignments:
+		my $error = 0;
+		for (my $i = 0; $i < $m; $i++) {
+			my @values;
+			for (my $g = 0; $g < $k; $g++) {
+				my $sum = 0;
+				for (my $j = 0; $j < $n; $j++) {
+					if ($confidence->[$i][$j]) {
+						my $local_sum =
+							$tmp1[$i][$j]
+							- $a_coc[$g][$item_clustering[$j]]
+							+ $a_rc[$g]
+							+ $a_cc[$item_clustering[$j]];
+						$sum = $sum + $local_sum * $local_sum;
+					}
+				}
+				$values[$g] = $sum;
+			}
+			my $cluster = array_get_minimum_index(@values);
+			$error = $error + $values[$cluster];
+			$user_clustering[$i] = $cluster;
+		}
+
+		# 2c. Update column cluster assignments:
+		for (my $j = 0; $j < $n; $j++) {
+			my @values;
+			for (my $h = 0; $h < $l; $h++) {
+				my $sum = 0;
+				for (my $i = 0; $i < $m; $i++) {
+					if ($confidence->[$i][$j]) {
+						my $local_sum =
+							$tmp1[$i][$j]
+							- $a_coc[$user_clustering[$i]][$h]
+							+ $a_rc[$user_clustering[$i]]
+							+ $a_cc[$h];
+						$sum = $sum + $local_sum * $local_sum;
+					}
+				}
+
+				$values[$h] = $sum;
+			}
+			my $cluster = array_get_minimum_index(@values);
+			$error = $error + $values[$cluster];
+			$item_clustering[$j] = $cluster;
+		}
+
+		print STDERR "Error: $error\n" if $verbose;
+		$delta = abs($old_error - $error);
+		$old_error = $error;
+		$counter++;
+	}
+	print STDERR "Clustering converged after $counter iterations.\n" if $verbose;
+
+	return (\@user_clustering, \@item_clustering);
+}
+
+
+sub contains_only_zeros ($) {
+	my $matrix = shift;
+
+	my $m = @$matrix;
+	my $tmp_ref = $matrix->[0];
+	my $n = @$tmp_ref;
+
+	for (my $i = 0; $i < $m; $i++) {
+		for (my $j = 0; $j < $n; $j++) {
+#			print STDERR "$i, $j: $matrix_ref->[$i][$j]\n";
+			if ($matrix->[$i][$j] > 0) {
+				return 0;
+			}
+		}
+	}
+
+	return 1;
+}
+
+
+sub compute_sparseness ($) {
+	my $matrix = shift;
+
+	my $m = @$matrix;		# number of rows
+	my $n = @{$matrix->[0]};	# number of columns
+
+	my $count = 0;
+	for (my $i = 0; $i < $m; $i++) {
+		for (my $j = 0; $j < $n; $j++) {
+			if ($matrix->[$i][$j] != 0) {
+				$count++;
+			}
+		}
+	}
+	
+	return (($count * 100) / ($m * $n));
+}
+
+sub compute_global_average ($$) {
+	my $ratings = shift;
+	my $confidence = shift;
+
+	my $m = @$ratings;		# number of rows
+	my $n = @{$ratings->[0]};	# number of columns
+
+	my $sum = 0;
+	my $number_of_ratings = 0;
+	for (my $i = 0; $i < $m; $i++) {
+		my @tmp;
+		for (my $j = 0; $j < $n; $j++) {
+			if ($confidence->[$i][$j] == 1) {
+				$sum = $sum + $ratings->[$i][$j];
+				$number_of_ratings++;
+			}
+		}
+	}
+	
+	if ($number_of_ratings > 0) {
+		return $sum / $number_of_ratings;
+	} else {
+		warn "Empty confidence matrix.\n";
+		return 0;
+		#return ($scale_from + $scale_to) / 2;
+	}
+}
+
+
+# TODO: for larger arrays: call by reference ...
+# array must have at least length 1
+sub array_get_minimum_index (@) {
+	my @array = @_;
+
+	my $length = @array;
+	my $minimum = $array[0];
+	my $minimum_index = 0;
+	for (my $i = 1; $i < $length; $i++) {
+		if ($array[$i] < $minimum) {
+			$minimum = $array[$i];
+			$minimum_index = $i;
+		}
+	}
+	return $minimum_index;
+}
+
+1;

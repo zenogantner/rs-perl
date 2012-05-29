@@ -1,0 +1,75 @@
+# This file is part of the Perl Collaborative Filtering Framework
+#
+# Copyright (C) 2006, 2007, 2008 Zeno Gantner
+#
+# This software is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this software.  If not, see <http://www.gnu.org/licenses/>.
+
+
+use strict;
+use warnings;
+
+package Ratings::Convert;
+use base 'Exporter';
+our @EXPORT = qw{ complete_to_sparse };
+
+my $PACK_TEMPLATE = 'JJ'; # TODO: think about where to put the template ...
+
+# in:  sparse ratings matrix (hash_ref)
+# out: complete ratings matrix, confidence matrix (array_ref)
+#sub sparse_to_complete {
+#}
+
+
+#sub complete_to_sparse {
+#	my ($rating_complete_ref, $confidence_ref) = @_;
+#
+#	my $m = @$confidence_ref;         # number of rows
+#	my $n = @{$confidence_ref->[0]};  # number of columns
+#
+#	my %rating;
+#	for (my $i = 0; $i < $m; $i++) {
+#		for (my $j = 0; $j < $n; $j++) {
+#			if ($confidence_ref->[$i][$j] != 0) {
+#				$rating{"$i-$j"} = $rating_complete_ref->[$i][$j];
+#			}
+#		}
+#	}
+#	
+#	return \%rating;
+#}
+
+
+# in:   complete ratings matrix, confidence matrix (array_ref)
+# out:  sparse ratings matrix (hash_ref)
+sub complete_to_sparse {
+	my ($rating_complete_ref, $confidence_ref) = @_;
+
+	my $m = @$confidence_ref;         # number of rows
+	my $n = @{$confidence_ref->[0]};  # number of columns
+
+	my %rating;
+	for (my $i = 0; $i < $m; $i++) {
+		for (my $j = 0; $j < $n; $j++) {
+			if ($confidence_ref->[$i][$j] != 0) {
+				my $key = pack($PACK_TEMPLATE, $i, $j);
+				$rating{$key} = $rating_complete_ref->[$i][$j];
+			}
+		}
+	}
+	
+	return \%rating;
+}
+
+
+1;
