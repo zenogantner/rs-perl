@@ -1,5 +1,3 @@
-TODO: add (c) notes in the directories
-
 Simple recommender system framework in Perl, developed for my Master's thesis
 in 2006/2007, with some later changes.
 Contains an implementation of George and Merugu's coclustering-based
